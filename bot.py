@@ -25,7 +25,6 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 DB_PATH = os.getenv("DB_PATH", "bot.db")
-
 FREE_CREDITS = int(os.getenv("FREE_CREDITS", "3"))
 
 PACK_10_STARS = int(os.getenv("PACK_10_STARS", "50"))
@@ -35,9 +34,9 @@ IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-image-1")
 IMAGE_SIZE = os.getenv("IMAGE_SIZE", "1024x1024")
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN не найден в .env")
+    raise RuntimeError("BOT_TOKEN не найден")
 if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY не найден в .env")
+    raise RuntimeError("OPENAI_API_KEY не найден")
 
 logging.basicConfig(level=logging.INFO)
 
@@ -276,7 +275,7 @@ def after_gen_keyboard():
 
 
 # =========================
-# OPENAI IMAGE
+# IMAGE GENERATION
 # =========================
 
 def generate_image_bytes(prompt: str) -> bytes:
@@ -285,7 +284,6 @@ def generate_image_bytes(prompt: str) -> bytes:
         prompt=prompt,
         size=IMAGE_SIZE,
     )
-
     image_b64 = result.data[0].b64_json
     return base64.b64decode(image_b64)
 
@@ -302,7 +300,7 @@ async def cmd_start(message: types.Message):
     text = (
         f"Привет, {message.from_user.first_name or 'друг'} 👋\n\n"
         f"У тебя {user['credits']} бесплатных генераций.\n"
-        f"Просто напиши описание картинки.\n\n"
+        f"Напиши описание картинки или нажми кнопку ниже.\n\n"
         f"Пример:\n"
         f"<i>Девушка в красном платье, студийный портрет</i>"
     )
@@ -342,24 +340,26 @@ async def profile_handler(message: types.Message):
 @dp.message_handler(lambda m: m.text == "💳 Купить")
 async def buy_menu_handler(message: types.Message):
     ensure_user(message.from_user)
-    await message.answer(
-        "Выбери пакет генераций 👇",
-        reply_markup=buy_keyboard()
-    )
+    await message.answer("Выбери пакет генераций 👇", reply_markup=buy_keyboard())
 
 
 @dp.message_handler(lambda m: m.text == "ℹ️ Помощь")
 async def help_handler(message: types.Message):
     await message.answer(
         "ℹ️ Как пользоваться ботом\n\n"
-        "1. Напиши описание картинки\n"
-        "2. Получи результат\n"
+        "1. Нажми «Создать» или просто напиши промпт\n"
+        "2. Получи картинку\n"
         "3. Нажми «Повторить», если нужен ещё вариант\n"
         "4. Если кредиты закончатся — купи пакет\n\n"
         "Команды:\n"
         "/start — запустить бота\n"
         "/stats — статистика для админа"
     )
+
+
+@dp.message_handler(lambda m: m.text == "🎨 Создать")
+async def create_hint_handler(message: types.Message):
+    await message.answer("Напиши описание картинки текстом 🎨")
 
 
 @dp.message_handler(lambda m: m.text == "🔄 Повторить")
@@ -380,7 +380,6 @@ async def repeat_from_menu_handler(message: types.Message):
     try:
         image_bytes = generate_image_bytes(user["last_prompt"])
         subtract_credit(message.from_user.id)
-
         updated_user = get_user(message.from_user.id)
 
         photo = io.BytesIO(image_bytes)
@@ -417,7 +416,6 @@ async def regen_callback(call: types.CallbackQuery):
     try:
         image_bytes = generate_image_bytes(user["last_prompt"])
         subtract_credit(call.from_user.id)
-
         updated_user = get_user(call.from_user.id)
 
         photo = io.BytesIO(image_bytes)
@@ -501,11 +499,6 @@ async def successful_payment_handler(message: types.Message):
     )
 
 
-@dp.message_handler(lambda m: m.text == "🎨 Создать")
-async def create_hint_handler(message: types.Message):
-    await message.answer("Напиши описание картинки текстом 🎨")
-
-
 @dp.message_handler(content_types=types.ContentType.TEXT)
 async def generate_handler(message: types.Message):
     text = (message.text or "").strip()
@@ -524,7 +517,7 @@ async def generate_handler(message: types.Message):
 
     if user["credits"] <= 0:
         await message.answer(
-            "❌ Бесплатные генерации закончились.\nВыбери пакет 👇",
+            "❌ Генерации закончились.\nВыбери пакет 👇",
             reply_markup=buy_keyboard()
         )
         return
@@ -533,7 +526,6 @@ async def generate_handler(message: types.Message):
 
     try:
         image_bytes = generate_image_bytes(text)
-
         subtract_credit(message.from_user.id)
         set_last_prompt(message.from_user.id, text)
         save_generation(message.from_user.id, text)

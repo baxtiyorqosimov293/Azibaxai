@@ -3,9 +3,10 @@ import io
 import base64
 import sqlite3
 import logging
+import threading
 from contextlib import closing
-from urllib.parse import quote_plus
 
+from flask import Flask
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -46,6 +47,20 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 client = OpenAI(api_key=OPENAI_API_KEY)
+
+# =========================
+# FLASK FOR RENDER WEB SERVICE
+# =========================
+
+web_app = Flask(__name__)
+
+@web_app.route("/")
+def home():
+    return "Bot is running"
+
+def run_web():
+    port = int(os.environ.get("PORT", 10000))
+    web_app.run(host="0.0.0.0", port=port)
 
 
 # =========================
@@ -104,6 +119,7 @@ def init_db():
 def ensure_user(tg_user: types.User):
     with closing(get_conn()) as conn:
         cur = conn.cursor()
+
         cur.execute("SELECT user_id FROM users WHERE user_id = ?", (tg_user.id,))
         row = cur.fetchone()
 
@@ -674,19 +690,5 @@ async def generate_handler(message: types.Message):
 
 if __name__ == "__main__":
     init_db()
+    threading.Thread(target=run_web).start()
     executor.start_polling(dp, skip_updates=True)
-import os
-from flask import Flask
-import threading
-
-app = Flask(__name__)
-
-@app.route("/")
-def home():
-    return "Bot is running"
-
-def run():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
-
-threading.Thread(target=run).start()

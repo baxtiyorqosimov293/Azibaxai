@@ -4,6 +4,7 @@ import base64
 import sqlite3
 import logging
 from contextlib import closing
+from urllib.parse import quote_plus
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -22,13 +23,15 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+BOT_USERNAME = os.getenv("BOT_USERNAME", "your_bot_username").replace("@", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 FREE_CREDITS = int(os.getenv("FREE_CREDITS", "3"))
+REF_BONUS = int(os.getenv("REF_BONUS", "3"))
 
-PACK_10_STARS = int(os.getenv("PACK_10_STARS", "50"))
-PACK_50_STARS = int(os.getenv("PACK_50_STARS", "200"))
+PACK_10_STARS = int(os.getenv("PACK_10_STARS", "69"))
+PACK_50_STARS = int(os.getenv("PACK_50_STARS", "250"))
 
 IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-image-1")
 IMAGE_SIZE = os.getenv("IMAGE_SIZE", "1024x1024")
@@ -65,6 +68,9 @@ def init_db():
             credits INTEGER NOT NULL DEFAULT 0,
             total_spent INTEGER NOT NULL DEFAULT 0,
             total_generations INTEGER NOT NULL DEFAULT 0,
+            ref_count INTEGER NOT NULL DEFAULT 0,
+            referred_by INTEGER,
+            referral_bonus_received INTEGER NOT NULL DEFAULT 0,
             last_prompt TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -98,7 +104,6 @@ def init_db():
 def ensure_user(tg_user: types.User):
     with closing(get_conn()) as conn:
         cur = conn.cursor()
-
         cur.execute("SELECT user_id FROM users WHERE user_id = ?", (tg_user.id,))
         row = cur.fetchone()
 
@@ -130,7 +135,10 @@ def get_user(user_id: int):
     with closing(get_conn()) as conn:
         cur = conn.cursor()
         cur.execute("""
-            SELECT user_id, username, first_name, credits, total_spent, total_generations, last_prompt
+            SELECT
+                user_id, username, first_name, credits, total_spent,
+                total_generations, ref_count, referred_by,
+                referral_bonus_received, last_prompt
             FROM users
             WHERE user_id = ?
         """, (user_id,))
@@ -146,7 +154,10 @@ def get_user(user_id: int):
             "credits": row[3],
             "total_spent": row[4],
             "total_generations": row[5],
-            "last_prompt": row[6],
+            "ref_count": row[6],
+            "referred_by": row[7],
+            "referral_bonus_received": row[8],
+            "last_prompt": row[9],
         }
 
 
@@ -206,6 +217,19 @@ def save_generation(user_id: int, prompt: str):
         conn.commit()
 
 
+def get_last_generations(user_id: int, limit: int = 5):
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT prompt, created_at
+            FROM generations
+            WHERE user_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+        """, (user_id, limit))
+        return cur.fetchall()
+
+
 def save_payment(user_id: int, payload: str, stars_amount: int, credits_added: int, telegram_payment_charge_id: str):
     with closing(get_conn()) as conn:
         cur = conn.cursor()
@@ -214,6 +238,49 @@ def save_payment(user_id: int, payload: str, stars_amount: int, credits_added: i
             VALUES (?, ?, ?, ?, ?)
         """, (user_id, payload, stars_amount, credits_added, telegram_payment_charge_id))
         conn.commit()
+
+
+def apply_referral(new_user_id: int, referrer_id: int):
+    if new_user_id == referrer_id:
+        return False, "Нельзя пригласить самого себя."
+
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT referred_by, referral_bonus_received
+            FROM users
+            WHERE user_id = ?
+        """, (new_user_id,))
+        row = cur.fetchone()
+
+        if not row:
+            return False, "Пользователь не найден."
+
+        referred_by, referral_bonus_received = row
+
+        if referred_by is not None or referral_bonus_received:
+            return False, "Реферальный бонус уже использован."
+
+        cur.execute("SELECT user_id FROM users WHERE user_id = ?", (referrer_id,))
+        ref_exists = cur.fetchone()
+        if not ref_exists:
+            return False, "Реферер не найден."
+
+        cur.execute("""
+            UPDATE users
+            SET referred_by = ?, referral_bonus_received = 1, credits = credits + ?, updated_at = CURRENT_TIMESTAMP
+            WHERE user_id = ?
+        """, (referrer_id, REF_BONUS, new_user_id))
+
+        cur.execute("""
+            UPDATE users
+            SET credits = credits + ?, ref_count = ref_count + 1, updated_at = CURRENT_TIMESTAMP
+            WHERE user_id = ?
+        """, (REF_BONUS, referrer_id))
+
+        conn.commit()
+        return True, "Реферальный бонус начислен."
 
 
 def get_stats():
@@ -229,10 +296,14 @@ def get_stats():
         cur.execute("SELECT COALESCE(SUM(total_generations), 0) FROM users")
         gens_sum = cur.fetchone()[0]
 
+        cur.execute("SELECT COALESCE(SUM(ref_count), 0) FROM users")
+        refs_sum = cur.fetchone()[0]
+
         return {
             "users": users_count,
             "stars": stars_sum,
             "generations": gens_sum,
+            "refs": refs_sum,
         }
 
 
@@ -248,6 +319,10 @@ def main_menu():
     )
     kb.add(
         KeyboardButton("💳 Купить"),
+        KeyboardButton("🕘 История"),
+    )
+    kb.add(
+        KeyboardButton("👥 Пригласить"),
         KeyboardButton("🔄 Повторить"),
     )
     kb.add(
@@ -295,11 +370,22 @@ def generate_image_bytes(prompt: str) -> bytes:
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
     ensure_user(message.from_user)
+    parts = (message.get_args() or "").strip()
+
+    if parts.isdigit():
+        referrer_id = int(parts)
+        ok, msg = apply_referral(message.from_user.id, referrer_id)
+        if ok:
+            await message.answer(f"🎁 {msg}\nТебе и другу начислено по {REF_BONUS} генерации.")
+        else:
+            if "уже использован" not in msg and "самого себя" not in msg:
+                await message.answer(msg)
+
     user = get_user(message.from_user.id)
 
     text = (
         f"Привет, {message.from_user.first_name or 'друг'} 👋\n\n"
-        f"У тебя {user['credits']} бесплатных генераций.\n"
+        f"У тебя {user['credits']} генераций.\n"
         f"Напиши описание картинки или нажми кнопку ниже.\n\n"
         f"Пример:\n"
         f"<i>Девушка в красном платье, студийный портрет</i>"
@@ -318,7 +404,8 @@ async def cmd_stats(message: types.Message):
         "📊 Статистика\n\n"
         f"Пользователей: {stats['users']}\n"
         f"Всего Stars: {stats['stars']}\n"
-        f"Всего генераций: {stats['generations']}"
+        f"Всего генераций: {stats['generations']}\n"
+        f"Всего рефералов: {stats['refs']}"
     )
 
 
@@ -332,7 +419,8 @@ async def profile_handler(message: types.Message):
         f"ID: <code>{user['user_id']}</code>\n"
         f"Кредиты: <b>{user['credits']}</b>\n"
         f"Всего потратил: <b>{user['total_spent']} Stars</b>\n"
-        f"Всего генераций: <b>{user['total_generations']}</b>",
+        f"Всего генераций: <b>{user['total_generations']}</b>\n"
+        f"Приглашено друзей: <b>{user['ref_count']}</b>",
         parse_mode="HTML"
     )
 
@@ -350,7 +438,8 @@ async def help_handler(message: types.Message):
         "1. Нажми «Создать» или просто напиши промпт\n"
         "2. Получи картинку\n"
         "3. Нажми «Повторить», если нужен ещё вариант\n"
-        "4. Если кредиты закончатся — купи пакет\n\n"
+        "4. Если кредиты закончатся — купи пакет\n"
+        "5. Приглашай друзей и получай бонусы\n\n"
         "Команды:\n"
         "/start — запустить бота\n"
         "/stats — статистика для админа"
@@ -360,6 +449,41 @@ async def help_handler(message: types.Message):
 @dp.message_handler(lambda m: m.text == "🎨 Создать")
 async def create_hint_handler(message: types.Message):
     await message.answer("Напиши описание картинки текстом 🎨")
+
+
+@dp.message_handler(lambda m: m.text == "🕘 История")
+async def history_handler(message: types.Message):
+    ensure_user(message.from_user)
+    rows = get_last_generations(message.from_user.id, limit=5)
+
+    if not rows:
+        await message.answer("История пока пустая.")
+        return
+
+    text = "🕘 Последние запросы:\n\n"
+    for i, (prompt, created_at) in enumerate(rows, start=1):
+        short_prompt = prompt if len(prompt) <= 80 else prompt[:80] + "..."
+        text += f"{i}. {short_prompt}\n"
+
+    await message.answer(text)
+
+
+@dp.message_handler(lambda m: m.text == "👥 Пригласить")
+async def referral_handler(message: types.Message):
+    ensure_user(message.from_user)
+    user_id = message.from_user.id
+
+    if not BOT_USERNAME or BOT_USERNAME == "your_bot_username":
+        await message.answer("Укажи BOT_USERNAME в переменных окружения.")
+        return
+
+    referral_link = f"https://t.me/{BOT_USERNAME}?start={user_id}"
+
+    await message.answer(
+        "👥 Приглашай друзей и получай бонусы\n\n"
+        f"За каждого друга: +{REF_BONUS} генерации тебе и ему.\n\n"
+        f"Твоя ссылка:\n{referral_link}"
+    )
 
 
 @dp.message_handler(lambda m: m.text == "🔄 Повторить")
@@ -380,6 +504,7 @@ async def repeat_from_menu_handler(message: types.Message):
     try:
         image_bytes = generate_image_bytes(user["last_prompt"])
         subtract_credit(message.from_user.id)
+        save_generation(message.from_user.id, user["last_prompt"])
         updated_user = get_user(message.from_user.id)
 
         photo = io.BytesIO(image_bytes)
@@ -416,6 +541,7 @@ async def regen_callback(call: types.CallbackQuery):
     try:
         image_bytes = generate_image_bytes(user["last_prompt"])
         subtract_credit(call.from_user.id)
+        save_generation(call.from_user.id, user["last_prompt"])
         updated_user = get_user(call.from_user.id)
 
         photo = io.BytesIO(image_bytes)
@@ -509,7 +635,7 @@ async def generate_handler(message: types.Message):
     if text.startswith("/"):
         return
 
-    if text in {"🎨 Создать", "👤 Профиль", "💳 Купить", "🔄 Повторить", "ℹ️ Помощь"}:
+    if text in {"🎨 Создать", "👤 Профиль", "💳 Купить", "🕘 История", "👥 Пригласить", "🔄 Повторить", "ℹ️ Помощь"}:
         return
 
     ensure_user(message.from_user)
